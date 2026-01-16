@@ -1,0 +1,17 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "OpenEnergy",
+        "description": "Connect Home Assistant to your OpenEnergy account.",
+        "data": {
+          "portal_url": "OpenEnergy portal URL"
+        }
+      }
+    },
+    "abort": {
+      "already_configured": "OpenEnergy is already configured for this portal."
+    }
+  }
+}
+
