@@ -1,0 +1,15 @@
+cd ~/work/openenergy-ha-addons
+
+# 1) Est-ce que Git voit un submodule ?
+git submodule status
+
+# 2) Est-ce que le repo a bien le mapping submodule -> URL ?
+cat .gitmodules
+
+# 3) Dans le submodule, est-ce qu'il y a un .git (souvent un FICHIER) ?
+ls -la config/custom_components/openenergy/.git
+
+# Si non :
+cd ~/work/openenergy-ha-addons
+git submodule sync --recursive
+git submodule update --init --recursive
