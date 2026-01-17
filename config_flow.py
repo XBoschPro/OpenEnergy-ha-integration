@@ -1,50 +1,31 @@
 """Config flow for OpenEnergy integration."""
-
 from __future__ import annotations
-
-import voluptuous as vol
-
-from homeassistant import config_entries
-from homeassistant.core import HomeAssistant
-from homeassistant.data_entry_flow import FlowResult
-
-from .const import DOMAIN
+from homeassistant.helpers import config_entry_oauth2_flow
+from .const import DOMAIN, LOGGER
 
 
-STEP_USER_SCHEMA = vol.Schema(
-    {
-        vol.Required("portal_url", default="https://portal.openenergy.example"): str,
-    }
-)
+class OAuth2FlowHandler(
+    config_entry_oauth2_flow.AbstractOAuth2FlowHandler, domain=DOMAIN
+):
+    """Config flow to handle OpenEnergy OAuth2 authentication."""
 
+    DOMAIN = DOMAIN
 
-class OpenEnergyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
-    """Handle a config flow for OpenEnergy."""
+    @property
+    def logger(self):
+        """Return logger."""
+        return LOGGER
 
-    VERSION = 1
+    @property
+    def extra_authorize_data(self) -> dict:
+        """Extra data that needs to be appended to the authorize url."""
+        return {"scope": "openid email profile offline_access"}
 
-    async def async_step_user(self, user_input: dict | None = None) -> FlowResult:
-        """Handle the initial step.
+    async def async_step_user(self, user_input: dict | None = None) -> dict:
+        """Handle a flow initiated by the user."""
+        return await self.async_step_auth()
 
-        For step 1, we only store a portal URL and create the config entry.
-        OAuth and Supervisor actions come in later steps.
-        """
-        if user_input is None:
-            return self.async_show_form(step_id="user", data_schema=STEP_USER_SCHEMA)
-
-        await self.async_set_unique_id(f"openenergy::{user_input['portal_url']}")
-        self._abort_if_unique_id_configured()
-
-        return self.async_create_entry(
-            title="OpenEnergy",
-            data={
-                "portal_url": user_input["portal_url"].rstrip("/"),
-            },
-        )
-
-
-async def async_get_config_entry_data(hass: HomeAssistant, entry_id: str) -> dict:
-    """Return config entry data for debugging."""
-    entry = hass.config_entries.async_get_entry(entry_id)
-    return {} if entry is None else dict(entry.data)
+    async def async_oauth_create_entry(self, data: dict) -> dict:
+        """Create an entry for the flow, or update existing entry."""
+        return self.async_create_entry(title="OpenEnergy", data=data)
 

@@ -7,6 +7,14 @@
   "integration_type": "hub",
   "iot_class": "cloud_push",
   "requirements": [],
-  "version": "0.1.0"
+  "version": "0.1.0",
+  "oauth2": {
+    "clients": {
+      "https://sso.openenergy.cloud/auth/realms/public": {
+        "client_id": "openenergy-ha",
+        "scopes": ["openid", "email", "profile", "offline_access"]
+      }
+    }
+  }
 }
 
