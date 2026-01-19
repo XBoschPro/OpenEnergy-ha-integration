@@ -2,10 +2,10 @@
   "domain": "openenergy",
   "name": "OpenEnergy",
   "config_flow": true,
-  "dependencies": ["auth"],
+  "dependencies": [],
   "documentation": "https://portal.openenergy.be/",
   "integration_type": "hub",
   "iot_class": "cloud_poll",
   "requirements": [],
-  "version": "0.2.1"
+  "version": "0.3.0-dev"
 }

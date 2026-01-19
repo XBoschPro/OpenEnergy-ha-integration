@@ -1,9 +1,14 @@
 """OpenEnergy integration.
 
-This integration will orchestrate:
-- OAuth login to OpenEnergy/Keycloak (later)
-- Supervisor add-on bootstrap (repo/add/install/options/start)
-- Patching Home Assistant configuration.yaml for reverse proxy trust
+Current scope:
+- Device Authorization Grant (Keycloak)
+- Exchange Keycloak access token -> OpenEnergy opaque token (server-side)
+- Options menu (status, reconnect, rotate token, disconnect, advanced info)
+
+Later:
+- Supervisor add-on bootstrap
+- Patch configuration.yaml
+- FRP provisioning
 """
 
 from __future__ import annotations
@@ -33,4 +38,3 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if unload_ok:
         hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
     return unload_ok
-

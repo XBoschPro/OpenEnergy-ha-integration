@@ -1,85 +1,46 @@
-"""Config flow for OpenEnergy integration (Keycloak OAuth2 + Options menu).
+"""Config flow for OpenEnergy using Keycloak Device Authorization Grant.
 
-This flow supports:
-- OAuth2 Authorization Code + PKCE against Keycloak (public client)
-- Token storage modes:
-  - exchange (recommended): exchange KC access token for OpenEnergy token (revocable/scoped)
-  - kc_access_only: store only KC access token (reauth more frequent)
-  - kc_refresh: store KC refresh token (requires offline_access, more convenient but higher risk)
-
-It also provides an OptionsFlow acting as a "menu":
-- Connection status
-- Server status (public health endpoint)
-- Reconnect
-- Disconnect
+Flow overview:
+1) User enters issuer/client_id/portal_url (and optional health url).
+2) Integration requests device_code + user_code from Keycloak.
+3) Integration displays a code + verification URL.
+4) User authenticates on Keycloak website and enters the code.
+5) User clicks "Continue" in HA; we poll token endpoint once per click.
+6) On token success, we fetch userinfo (sub/email).
+7) We call OpenEnergy exchange endpoint to obtain an opaque device token.
+   - If exchange is not ready yet, we still create an entry but mark it not connected.
 """
 
 from __future__ import annotations
 
 import logging
 from typing import Any
-import inspect
 
 import voluptuous as vol
 
 from homeassistant import config_entries
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.data_entry_flow import FlowResult
-from homeassistant.helpers import aiohttp_client
-from homeassistant.helpers import config_entry_oauth2_flow
 
-from .auth import build_keycloak_endpoints, build_oauth2_implementation
+from .api import exchange_token, get_health, rotate_token
 from .const import (
     CONF_CLIENT_ID,
+    CONF_HEALTH_URL,
     CONF_ISSUER_URL,
     CONF_PORTAL_URL,
-    CONF_TOKEN_STORAGE,
     DATA_KC_USER,
-    DATA_OAUTH_IMPL,
-    DATA_OAUTH_TOKEN,
     DATA_OE_TOKEN,
+    DATA_PROVISIONING_STATE,
     DEFAULT_CLIENT_ID,
     DEFAULT_HEALTH_URL,
     DEFAULT_ISSUER_URL,
     DEFAULT_PORTAL_URL,
     DOMAIN,
     SCOPE_BASE,
-    SCOPE_OFFLINE,
-    TOKEN_STORAGE_EXCHANGE,
-    TOKEN_STORAGE_KC_ACCESS,
-    TOKEN_STORAGE_KC_REFRESH,
 )
+from .device_auth import DeviceCodeResponse, fetch_userinfo, poll_token_once, request_device_code
 
 _LOGGER = logging.getLogger(__name__)
-
-
-def _storage_options() -> dict[str, str]:
-    """Return storage mode mapping used in voluptuous selectors."""
-    return {
-        TOKEN_STORAGE_EXCHANGE: "Recommended: exchange KC token for OpenEnergy token (revocable, scoped)",
-        TOKEN_STORAGE_KC_ACCESS: "More secure: store KC access only (reauth more often)",
-        TOKEN_STORAGE_KC_REFRESH: "More convenient: store KC refresh token (offline_access; higher risk if HA compromised)",
-    }
-
-
-async def _async_register_oauth_implementation(hass: HomeAssistant, implementation: Any) -> None:
-    """Register an OAuth2 implementation (compatible across HA versions)."""
-    func = getattr(config_entry_oauth2_flow, "async_register_implementation", None)
-    if func is None:
-        raise RuntimeError("Home Assistant does not provide async_register_implementation")
-
-    # Some HA versions define it as a regular callback, others as a coroutine.
-    if inspect.iscoroutinefunction(func):
-        try:
-            await func(hass, DOMAIN, implementation)
-        except TypeError:
-            await func(hass, implementation)
-    else:
-        try:
-            func(hass, DOMAIN, implementation)
-        except TypeError:
-            func(hass, implementation)
-
 
 
 STEP_USER_SCHEMA = vol.Schema(
@@ -87,276 +48,258 @@ STEP_USER_SCHEMA = vol.Schema(
         vol.Required(CONF_ISSUER_URL, default=DEFAULT_ISSUER_URL): str,
         vol.Required(CONF_CLIENT_ID, default=DEFAULT_CLIENT_ID): str,
         vol.Required(CONF_PORTAL_URL, default=DEFAULT_PORTAL_URL): str,
-        vol.Required(CONF_TOKEN_STORAGE, default=TOKEN_STORAGE_EXCHANGE): vol.In(_storage_options()),
+        vol.Required(CONF_HEALTH_URL, default=DEFAULT_HEALTH_URL): str,
     }
 )
 
 
-class OpenEnergyConfigFlow(config_entry_oauth2_flow.AbstractOAuth2FlowHandler, domain=DOMAIN):
-    """Handle the OpenEnergy config flow (OAuth2)."""
+class OpenEnergyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
+    """Handle a config flow for OpenEnergy."""
 
     VERSION = 1
     DOMAIN = DOMAIN
+
+    def __init__(self) -> None:
+        """Initialize flow state."""
+        self._issuer_url: str | None = None
+        self._client_id: str | None = None
+        self._portal_url: str | None = None
+        self._health_url: str | None = None
+
+        self._device: DeviceCodeResponse | None = None
+        self._last_token_error: str | None = None
 
     @property
     def logger(self) -> logging.Logger:
         """Return the logger used by this config flow."""
         return _LOGGER
-    
-    reauth_entry: config_entries.ConfigEntry | None = None
-    _issuer_url: str | None = None
-    _client_id: str | None = None
-    _portal_url: str | None = None
-    _token_storage: str | None = None
-    
-    @property
-    def extra_authorize_data(self) -> dict[str, Any]:
-        """Extra parameters appended to the authorize URL."""
-        scopes = SCOPE_BASE
-        if self._token_storage == TOKEN_STORAGE_KC_REFRESH:
-            scopes = f"{scopes} {SCOPE_OFFLINE}"
-        return {"scope": scopes}
-
-
-
-
 
     async def async_step_user(self, user_input: dict[str, Any] | None = None) -> FlowResult:
-        """Handle a flow started by a user."""
+        """Initial step where server endpoints are configured."""
         if user_input is None:
             return self.async_show_form(step_id="user", data_schema=STEP_USER_SCHEMA)
 
         self._issuer_url = user_input[CONF_ISSUER_URL].rstrip("/")
         self._client_id = user_input[CONF_CLIENT_ID]
         self._portal_url = user_input[CONF_PORTAL_URL].rstrip("/")
-        self._token_storage = user_input[CONF_TOKEN_STORAGE]
+        self._health_url = user_input[CONF_HEALTH_URL].rstrip("/")
 
-        # Unique id: one entry per Keycloak realm + client_id
-        await self.async_set_unique_id(f"openenergy::{self._issuer_url}::{self._client_id}")
+        await self.async_set_unique_id(f"openenergy::{self._portal_url}::{self._issuer_url}::{self._client_id}")
         self._abort_if_unique_id_configured()
 
-        impl = build_oauth2_implementation(self.hass, self._issuer_url, self._client_id)
-        await _async_register_oauth_implementation(self.hass, impl)
+        # Request device code now and proceed to device step.
+        try:
+            self._device = await request_device_code(
+                hass=self.hass,
+                issuer_url=self._issuer_url,
+                client_id=self._client_id,
+                scope=SCOPE_BASE,
+            )
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.error("Device authorization request failed: %s", err)
+            return self.async_show_form(
+                step_id="user",
+                data_schema=STEP_USER_SCHEMA,
+                errors={"base": "device_auth_failed"},
+            )
+        self._last_token_error = None
+        return await self.async_step_device()
 
+    async def async_step_device(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        """Display user_code and verification URI, then poll token endpoint on submit."""
+        if self._device is None or self._issuer_url is None or self._client_id is None:
+            return self.async_abort(reason="missing_device_state")
 
-        # Ensure OIDC scopes are present. Add offline_access only if user selected KC refresh mode.
-        scopes = SCOPE_BASE
-        if self._token_storage == TOKEN_STORAGE_KC_REFRESH:
-            scopes = f"{scopes} {SCOPE_OFFLINE}"
+        placeholders = {
+            "user_code": self._device.user_code,
+            "verification_uri": self._device.verification_uri,
+            "verification_uri_complete": self._device.verification_uri_complete or "",
+            "last_error": self._last_token_error or "",
+        }
 
-        # AbstractOAuth2FlowHandler supports extra authorize parameters.
-        # This ensures Keycloak gets `scope=openid ...`.
-        #self.extra_authorize_data = {"scope": scopes}
-
-        return await self.async_step_pick_implementation()
-
-    async def async_step_reauth(self, user_input: dict[str, Any] | None = None) -> FlowResult:
-        """Start a reauth flow (triggered by options menu or auth failures)."""
-        self.reauth_entry = self.hass.config_entries.async_get_entry(self.context["entry_id"])
-        if self.reauth_entry is None:
-            return self.async_abort(reason="reauth_entry_not_found")
-
-        self._issuer_url = self.reauth_entry.data[CONF_ISSUER_URL]
-        self._client_id = self.reauth_entry.data[CONF_CLIENT_ID]
-        self._portal_url = self.reauth_entry.data[CONF_PORTAL_URL]
-        self._token_storage = self.reauth_entry.data.get(CONF_TOKEN_STORAGE, TOKEN_STORAGE_EXCHANGE)
-
-        return await self.async_step_reauth_confirm()
-
-    async def async_step_reauth_confirm(self, user_input: dict[str, Any] | None = None) -> FlowResult:
-        """Confirm dialog shown before redirecting to Keycloak."""
         if user_input is None:
-            return self.async_show_form(step_id="reauth_confirm", data_schema=vol.Schema({}))
+            return self.async_show_form(
+                step_id="device",
+                data_schema=vol.Schema({}),
+                description_placeholders=placeholders,
+            )
 
-        impl = build_oauth2_implementation(self.hass, self._issuer_url, self._client_id)
-        await _async_register_oauth_implementation(self.hass, impl)
+        # Poll once per click.
+        token_result = await poll_token_once(
+            hass=self.hass,
+            issuer_url=self._issuer_url,
+            client_id=self._client_id,
+            device_code=self._device.device_code,
+        )
 
+        if isinstance(token_result, str):
+            # Not ready yet or some transient error.
+            self._last_token_error = token_result
+            return self.async_show_form(
+                step_id="device",
+                data_schema=vol.Schema({}),
+                description_placeholders=placeholders | {"last_error": token_result},
+            )
 
-        scopes = SCOPE_BASE
-        if self._token_storage == TOKEN_STORAGE_KC_REFRESH:
-            scopes = f"{scopes} {SCOPE_OFFLINE}"
-        #self.extra_authorize_data = {"scope": scopes}
+        # Success: fetch userinfo + exchange token.
+        access_token = token_result.access_token
+        kc_user = await fetch_userinfo(self.hass, self._issuer_url, access_token)
 
-        return await self.async_step_pick_implementation()
+        # Exchange for OpenEnergy token (may fail until API exists).
+        ha_uuid = str(self.hass.config.as_dict().get("config_source", "")) or self.hass.config.config_dir
+        ha_name = self.hass.config.location_name or "Home Assistant"
+        ha_version = str(self.hass.config.as_dict().get("version", ""))
 
-    async def async_oauth_create_entry(self, data: dict[str, Any]) -> FlowResult:
-        """Create or update the config entry after OAuth completes."""
-        issuer_url = self._issuer_url
-        client_id = self._client_id
-        portal_url = self._portal_url
-        token_storage = self._token_storage
-
-        if not issuer_url or not client_id or not portal_url or not token_storage:
-            return self.async_abort(reason="missing_setup_parameters")
-
-        oauth_token = data["token"]
-        auth_impl = data["auth_implementation"]
-
-        # Fetch userinfo to keep Keycloak identity (sub/email/username).
-        kc_user = await _fetch_keycloak_userinfo(self.hass, issuer_url, oauth_token)
+        oe_token = await exchange_token(
+            hass=self.hass,
+            portal_url=self._portal_url,
+            kc_access_token=access_token,
+            ha_uuid=ha_uuid,
+            ha_name=ha_name,
+            ha_version=ha_version,
+        )
 
         entry_data: dict[str, Any] = {
-            CONF_ISSUER_URL: issuer_url,
-            CONF_CLIENT_ID: client_id,
-            CONF_PORTAL_URL: portal_url,
-            CONF_TOKEN_STORAGE: token_storage,
-            DATA_OAUTH_IMPL: auth_impl,
+            CONF_ISSUER_URL: self._issuer_url,
+            CONF_CLIENT_ID: self._client_id,
+            CONF_PORTAL_URL: self._portal_url,
+            CONF_HEALTH_URL: self._health_url,
             DATA_KC_USER: kc_user,
         }
 
-        # Store KC token depending on mode.
-        if token_storage in (TOKEN_STORAGE_KC_ACCESS, TOKEN_STORAGE_KC_REFRESH, TOKEN_STORAGE_EXCHANGE):
-            entry_data[DATA_OAUTH_TOKEN] = oauth_token
-
-        # Exchange KC access token for OpenEnergy token if requested.
-        if token_storage == TOKEN_STORAGE_EXCHANGE:
-            oe_token = await _exchange_for_openenergy_token(self.hass, portal_url, oauth_token)
-            if oe_token:
-                entry_data[DATA_OE_TOKEN] = oe_token
-            else:
-                # Keep entry created even if exchange is not ready yet; user can retry later.
-                _LOGGER.warning("OpenEnergy token exchange failed (API missing or error).")
-
-        if self.reauth_entry is not None:
-            # Always reload after successful reauth.
-            return self.async_update_reload_and_abort(self.reauth_entry, data=entry_data)
+        if oe_token:
+            entry_data[DATA_OE_TOKEN] = oe_token
+            entry_data[DATA_PROVISIONING_STATE] = "ok"
+        else:
+            entry_data[DATA_PROVISIONING_STATE] = "exchange_failed"
 
         return self.async_create_entry(title="OpenEnergy", data=entry_data)
+
+    async def async_step_reauth(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        """Reauth uses the same device flow path."""
+        entry = self.hass.config_entries.async_get_entry(self.context["entry_id"])
+        if entry is None:
+            return self.async_abort(reason="reauth_entry_not_found")
+
+        self._issuer_url = entry.data[CONF_ISSUER_URL]
+        self._client_id = entry.data[CONF_CLIENT_ID]
+        self._portal_url = entry.data[CONF_PORTAL_URL]
+        self._health_url = entry.data.get(CONF_HEALTH_URL, DEFAULT_HEALTH_URL)
+
+        # Always request a new device code for reauth.
+        self._device = await request_device_code(
+            hass=self.hass,
+            issuer_url=self._issuer_url,
+            client_id=self._client_id,
+            scope=SCOPE_BASE,
+        )
+        self._last_token_error = None
+        return await self.async_step_device()
 
     @staticmethod
     @callback
     def async_get_options_flow(config_entry: config_entries.ConfigEntry) -> config_entries.OptionsFlow:
-        """Create the options flow."""
+        """Return the options flow handler."""
         return OpenEnergyOptionsFlow(config_entry)
 
 
 class OpenEnergyOptionsFlow(config_entries.OptionsFlow):
-    """Options flow acting as a small menu for the integration."""
+    """Options flow acting as a simple menu."""
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> FlowResult:
-        """Show the main menu."""
+        """Main menu."""
         return self.async_show_menu(
             step_id="init",
-            menu_options=["status", "server_status", "reconnect", "disconnect"],
+            menu_options=["status", "server_status", "reconnect", "rotate", "disconnect", "advanced"],
             sort=True,
         )
 
     async def async_step_status(self, user_input: dict[str, Any] | None = None) -> FlowResult:
-        """Display connection status."""
+        """Display token/user status."""
         data = self.config_entry.data
-        has_kc = DATA_OAUTH_TOKEN in data
-        has_oe = DATA_OE_TOKEN in data
         kc_user = data.get(DATA_KC_USER, {}) or {}
+        has_token = DATA_OE_TOKEN in data
+        prov = data.get(DATA_PROVISIONING_STATE, "not_connected")
 
         return self.async_show_form(
             step_id="status",
             data_schema=vol.Schema({}),
             description_placeholders={
-                "kc": "yes" if has_kc else "no",
-                "oe": "yes" if has_oe else "no",
+                "connected": "yes" if has_token else "no",
+                "provisioning": str(prov),
                 "sub": str(kc_user.get("sub", "")),
                 "email": str(kc_user.get("email", "")),
+                "username": str(kc_user.get("preferred_username", "")),
             },
         )
 
     async def async_step_server_status(self, user_input: dict[str, Any] | None = None) -> FlowResult:
-        """Check the portal public health endpoint."""
-        ok, details = await _check_health(self.hass, DEFAULT_HEALTH_URL)
+        """Check public health endpoint."""
+        health_url = self.config_entry.data.get(CONF_HEALTH_URL, DEFAULT_HEALTH_URL)
+        ok, details = await get_health(self.hass, health_url)
         return self.async_show_form(
             step_id="server_status",
             data_schema=vol.Schema({}),
             description_placeholders={
+                "url": health_url,
                 "ok": "yes" if ok else "no",
                 "details": details,
-                "url": DEFAULT_HEALTH_URL,
             },
         )
 
     async def async_step_reconnect(self, user_input: dict[str, Any] | None = None) -> FlowResult:
-        """Trigger a reauthentication flow."""
+        """Trigger device flow again (reauth/provision)."""
         self.config_entry.async_start_reauth(self.hass)
         return self.async_abort(reason="reauth_started")
 
-    async def async_step_disconnect(self, user_input: dict[str, Any] | None = None) -> FlowResult:
-        """Clear stored tokens and reload entry."""
+    async def async_step_rotate(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        """Rotate the OpenEnergy token via server API."""
         data = dict(self.config_entry.data)
-        data.pop(DATA_OAUTH_TOKEN, None)
-        data.pop(DATA_OE_TOKEN, None)
+        portal_url = data.get(CONF_PORTAL_URL, DEFAULT_PORTAL_URL)
+        oe_token = data.get(DATA_OE_TOKEN)
 
+        if not oe_token:
+            return self.async_show_form(
+                step_id="rotate",
+                data_schema=vol.Schema({}),
+                errors={"base": "no_token"},
+            )
+
+        new_token = await rotate_token(self.hass, portal_url, oe_token)
+        if not new_token:
+            return self.async_show_form(
+                step_id="rotate",
+                data_schema=vol.Schema({}),
+                errors={"base": "rotate_failed"},
+            )
+
+        data[DATA_OE_TOKEN] = new_token
+        data[DATA_PROVISIONING_STATE] = "ok"
+        self.hass.config_entries.async_update_entry(self.config_entry, data=data)
+        await self.hass.config_entries.async_reload(self.config_entry.entry_id)
+        return self.async_abort(reason="rotated")
+
+    async def async_step_disconnect(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        """Remove stored tokens and user identity."""
+        data = dict(self.config_entry.data)
+        data.pop(DATA_OE_TOKEN, None)
+        data.pop(DATA_KC_USER, None)
+        data[DATA_PROVISIONING_STATE] = "not_connected"
         self.hass.config_entries.async_update_entry(self.config_entry, data=data)
         await self.hass.config_entries.async_reload(self.config_entry.entry_id)
         return self.async_abort(reason="disconnected")
 
-
-async def _fetch_keycloak_userinfo(hass: HomeAssistant, issuer_url: str, oauth_token: dict[str, Any]) -> dict[str, Any]:
-    """Fetch Keycloak userinfo and return a small stable subset."""
-    ep = build_keycloak_endpoints(issuer_url)
-
-    try:
-        resp = await config_entry_oauth2_flow.async_oauth2_request(
-            hass, oauth_token, "get", ep.userinfo_url
+    async def async_step_advanced(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        """Display server-related configuration (read-only)."""
+        data = self.config_entry.data
+        return self.async_show_form(
+            step_id="advanced",
+            data_schema=vol.Schema({}),
+            description_placeholders={
+                "issuer": str(data.get(CONF_ISSUER_URL, "")),
+                "client_id": str(data.get(CONF_CLIENT_ID, "")),
+                "portal": str(data.get(CONF_PORTAL_URL, "")),
+                "health": str(data.get(CONF_HEALTH_URL, "")),
+            },
         )
-        payload = await resp.json()
-    except Exception as err:  # noqa: BLE001
-        _LOGGER.warning("Failed to fetch Keycloak userinfo: %s", err)
-        return {}
 
-    # Keep default claims only
-    return {
-        "sub": payload.get("sub"),
-        "email": payload.get("email"),
-        "preferred_username": payload.get("preferred_username"),
-        "name": payload.get("name"),
-    }
-
-
-async def _exchange_for_openenergy_token(
-    hass: HomeAssistant,
-    portal_url: str,
-    oauth_token: dict[str, Any],
-) -> str | None:
-    """Exchange Keycloak access token for an OpenEnergy token.
-
-    Expected endpoint (to implement server-side):
-      POST {portal_url}/api/ha/auth/exchange
-      Authorization: Bearer <KC access token>
-      Response JSON: {"token": "<opaque openenergy token>"}
-    """
-    access_token = oauth_token.get("access_token")
-    if not access_token:
-        return None
-
-    url = f"{portal_url}/api/ha/auth/exchange"
-    session = aiohttp_client.async_get_clientsession(hass)
-
-    try:
-        resp = await session.post(url, headers={"Authorization": f"Bearer {access_token}"}, timeout=20)
-    except Exception as err:  # noqa: BLE001
-        _LOGGER.warning("OpenEnergy exchange request failed: %s", err)
-        return None
-
-    if resp.status >= 400:
-        _LOGGER.warning("OpenEnergy exchange failed: HTTP %s", resp.status)
-        return None
-
-    try:
-        payload = await resp.json()
-    except Exception:  # noqa: BLE001
-        return None
-
-    token = payload.get("token")
-    return token if isinstance(token, str) and token else None
-
-
-async def _check_health(hass: HomeAssistant, url: str) -> tuple[bool, str]:
-    """Check portal health endpoint and return (ok, details)."""
-    session = aiohttp_client.async_get_clientsession(hass)
-
-    try:
-        resp = await session.get(url, timeout=10)
-        text = await resp.text()
-        ok = 200 <= resp.status < 300
-        details = f"HTTP {resp.status} - {text[:200]}"
-        return ok, details
-    except Exception as err:  # noqa: BLE001
-        return False, f"error: {err}"

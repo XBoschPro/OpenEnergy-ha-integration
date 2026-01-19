@@ -4,47 +4,59 @@
     "step": {
       "user": {
         "title": "OpenEnergy",
-        "description": "Connectez Home Assistant à votre compte OpenEnergy via Keycloak.",
+        "description": "Connectez Home Assistant à votre compte OpenEnergy via Keycloak (Device Authorization).",
         "data": {
           "issuer_url": "Issuer Keycloak (URL du realm)",
           "client_id": "Client ID Keycloak",
           "portal_url": "URL du portail OpenEnergy",
-          "token_storage": "Mode de stockage des tokens"
+          "health_url": "URL health OpenEnergy"
         }
       },
-      "reauth_confirm": {
-        "title": "Reconnexion",
-        "description": "Vous devez vous reconnecter à OpenEnergy."
+      "device": {
+        "title": "Connexion",
+        "description": "Ouvrez l’URL suivante et saisissez le code pour autoriser cette instance Home Assistant.\n\nURL de vérification : {verification_uri}\nURL de vérification (direct) : {verification_uri_complete}\nCode : {user_code}\n\nSi vous avez déjà autorisé, cliquez sur Continuer.\nDernier statut : {last_error}"
       }
     },
     "abort": {
-      "already_configured": "OpenEnergy est déjà configuré.",
-      "reauth_entry_not_found": "Impossible de retrouver l’entrée à réauthentifier.",
-      "missing_setup_parameters": "Paramètres de configuration manquants."
+      "missing_device_state": "État de connexion device manquant. Relancez la configuration.",
+      "missing_setup_parameters": "Paramètres requis manquants.",
+      "reauth_entry_not_found": "Impossible de retrouver l’entrée à réauthentifier."
     }
   },
   "options": {
     "step": {
       "init": {
         "menu_options": {
-          "disconnect": "Se déconnecter",
-          "reconnect": "Se connecter / Reconnecter",
+          "status": "Statut de connexion",
           "server_status": "Statut du serveur",
-          "status": "Statut de connexion"
+          "reconnect": "Se connecter / Reconnecter",
+          "rotate": "Renouveler le token",
+          "disconnect": "Se déconnecter",
+          "advanced": "Avancé (lecture seule)"
         }
       },
       "status": {
         "title": "Statut de connexion",
-        "description": "Token Keycloak stocké : {kc}\nToken OpenEnergy stocké : {oe}\nKeycloak sub : {sub}\nEmail : {email}"
+        "description": "Connecté : {connected}\nProvisioning : {provisioning}\nKeycloak sub : {sub}\nEmail : {email}\nUsername : {username}"
       },
       "server_status": {
         "title": "Statut du serveur",
         "description": "URL : {url}\nEn ligne : {ok}\nDétails : {details}"
+      },
+      "advanced": {
+        "title": "Avancé (lecture seule)",
+        "description": "Ces paramètres ne doivent pas être modifiés sauf si vous savez exactement ce que vous faites.\n\nIssuer : {issuer}\nClient ID : {client_id}\nPortail : {portal}\nHealth : {health}"
       }
     },
     "abort": {
-      "reauth_started": "La réauthentification a démarré.",
+      "reauth_started": "Authentification démarrée.",
+      "rotated": "Token renouvelé.",
       "disconnected": "Déconnecté."
+    },
+    "error": {
+      "no_token": "Aucun token stocké. Connectez-vous d’abord.",
+      "rotate_failed": "Le renouvellement du token a échoué.",
+       "device_auth_failed": "L'autorisation du device a échoué. Vérifiez les paramètres du client Keycloak et les logs du serveur."
     }
   }
 }

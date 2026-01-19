@@ -4,47 +4,59 @@
     "step": {
       "user": {
         "title": "OpenEnergy",
-        "description": "Connect Home Assistant to your OpenEnergy account via Keycloak.",
+        "description": "Connect Home Assistant to your OpenEnergy account using Keycloak (Device Authorization).",
         "data": {
           "issuer_url": "Keycloak issuer (realm URL)",
           "client_id": "Keycloak client ID",
           "portal_url": "OpenEnergy portal URL",
-          "token_storage": "Token storage mode"
+          "health_url": "OpenEnergy health URL"
         }
       },
-      "reauth_confirm": {
-        "title": "Reconnect",
-        "description": "You need to log in again to OpenEnergy."
+      "device": {
+        "title": "Sign in",
+        "description": "Open the following URL and enter the code to authorize this Home Assistant instance.\n\nVerification URL: {verification_uri}\nVerification URL (direct): {verification_uri_complete}\nCode: {user_code}\n\nIf you already authorized, click Continue.\nLast status: {last_error}"
       }
     },
     "abort": {
-      "already_configured": "OpenEnergy is already configured.",
-      "reauth_entry_not_found": "Unable to find the config entry to reauthenticate.",
-      "missing_setup_parameters": "Missing setup parameters."
+      "missing_device_state": "Device authorization state is missing. Restart the setup.",
+      "missing_setup_parameters": "Missing required parameters.",
+      "reauth_entry_not_found": "Could not find the entry to reauthenticate."
     }
   },
   "options": {
     "step": {
       "init": {
         "menu_options": {
-          "disconnect": "Disconnect",
-          "reconnect": "Connect / Reconnect",
+          "status": "Connection status",
           "server_status": "Server status",
-          "status": "Connection status"
+          "reconnect": "Connect / Reconnect",
+          "rotate": "Rotate token",
+          "disconnect": "Disconnect",
+          "advanced": "Advanced (read-only)"
         }
       },
       "status": {
         "title": "Connection status",
-        "description": "Keycloak token stored: {kc}\nOpenEnergy token stored: {oe}\nKeycloak sub: {sub}\nEmail: {email}"
+        "description": "Connected: {connected}\nProvisioning: {provisioning}\nKeycloak sub: {sub}\nEmail: {email}\nUsername: {username}"
       },
       "server_status": {
         "title": "Server status",
         "description": "URL: {url}\nOnline: {ok}\nDetails: {details}"
+      },
+      "advanced": {
+        "title": "Advanced (read-only)",
+        "description": "These settings should not be changed unless you know what you are doing.\n\nIssuer: {issuer}\nClient ID: {client_id}\nPortal: {portal}\nHealth: {health}"
       }
     },
     "abort": {
-      "reauth_started": "Reauthentication started.",
+      "reauth_started": "Authentication started.",
+      "rotated": "Token rotated.",
       "disconnected": "Disconnected."
+    },
+    "error": {
+      "no_token": "No token stored. Connect first.",
+      "rotate_failed": "Token rotation failed.",
+      "device_auth_failed": "Device authorization failed. Check Keycloak client settings and server logs."
     }
   }
 }
