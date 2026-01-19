@@ -1,0 +1,50 @@
+{
+  "title": "OpenEnergy",
+  "config": {
+    "step": {
+      "user": {
+        "title": "OpenEnergy",
+        "description": "Connectez Home Assistant à votre compte OpenEnergy via Keycloak.",
+        "data": {
+          "issuer_url": "Issuer Keycloak (URL du realm)",
+          "client_id": "Client ID Keycloak",
+          "portal_url": "URL du portail OpenEnergy",
+          "token_storage": "Mode de stockage des tokens"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Reconnexion",
+        "description": "Vous devez vous reconnecter à OpenEnergy."
+      }
+    },
+    "abort": {
+      "already_configured": "OpenEnergy est déjà configuré.",
+      "reauth_entry_not_found": "Impossible de retrouver l’entrée à réauthentifier.",
+      "missing_setup_parameters": "Paramètres de configuration manquants."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "menu_options": {
+          "disconnect": "Se déconnecter",
+          "reconnect": "Se connecter / Reconnecter",
+          "server_status": "Statut du serveur",
+          "status": "Statut de connexion"
+        }
+      },
+      "status": {
+        "title": "Statut de connexion",
+        "description": "Token Keycloak stocké : {kc}\nToken OpenEnergy stocké : {oe}\nKeycloak sub : {sub}\nEmail : {email}"
+      },
+      "server_status": {
+        "title": "Statut du serveur",
+        "description": "URL : {url}\nEn ligne : {ok}\nDétails : {details}"
+      }
+    },
+    "abort": {
+      "reauth_started": "La réauthentification a démarré.",
+      "disconnected": "Déconnecté."
+    }
+  }
+}
