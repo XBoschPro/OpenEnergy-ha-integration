@@ -7,8 +7,7 @@ Flow overview:
 4) User authenticates on Keycloak website and enters the code.
 5) User clicks "Continue" in HA; we poll token endpoint once per click.
 6) On token success, we fetch userinfo (sub/email).
-7) We call OpenEnergy exchange endpoint to obtain an opaque device token.
-   - If exchange is not ready yet, we still create an entry but mark it not connected.
+7) We call OpenEnergy enroll endpoint to obtain credentials.
 """
 
 from __future__ import annotations
@@ -21,8 +20,10 @@ import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.data_entry_flow import FlowResult
+from homeassistant.helpers import instance_id
 
-from .api import exchange_token, get_health, rotate_token
+from .addon import configure_frpc_addon
+from .api import enroll_ha, get_health, rotate_opaque_token, rotate_frp_secret
 from .const import (
     CONF_CLIENT_ID,
     CONF_HEALTH_URL,
@@ -30,6 +31,12 @@ from .const import (
     CONF_PORTAL_URL,
     DATA_KC_USER,
     DATA_OE_TOKEN,
+    DATA_SERVER_UUID,
+    DATA_FRP_SECRET,
+    DATA_FRP_SERVER_ADDR,
+    DATA_FRP_SERVER_PORT,
+    DATA_FRP_TLS_ENABLE,
+    DATA_TUNNEL_DOMAIN,
     DATA_PROVISIONING_STATE,
     DEFAULT_CLIENT_ID,
     DEFAULT_HEALTH_URL,
@@ -84,7 +91,9 @@ class OpenEnergyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._portal_url = user_input[CONF_PORTAL_URL].rstrip("/")
         self._health_url = user_input[CONF_HEALTH_URL].rstrip("/")
 
-        await self.async_set_unique_id(f"openenergy::{self._portal_url}::{self._issuer_url}::{self._client_id}")
+        # Unique ID based on portal + issuer to allow multiple setups if really needed,
+        # but usually one per HA instance.
+        await self.async_set_unique_id(f"openenergy::{self._portal_url}")
         self._abort_if_unique_id_configured()
 
         # Request device code now and proceed to device step.
@@ -141,22 +150,20 @@ class OpenEnergyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 description_placeholders=placeholders | {"last_error": token_result},
             )
 
-        # Success: fetch userinfo + exchange token.
+        # Success: fetch userinfo + enroll.
         access_token = token_result.access_token
         kc_user = await fetch_userinfo(self.hass, self._issuer_url, access_token)
 
-        # Exchange for OpenEnergy token (may fail until API exists).
-        ha_uuid = str(self.hass.config.as_dict().get("config_source", "")) or self.hass.config.config_dir
-        ha_name = self.hass.config.location_name or "Home Assistant"
-        ha_version = str(self.hass.config.as_dict().get("version", ""))
+        # Get stable ID for this HA instance
+        device_uid = await instance_id.async_get(self.hass)
+        label = self.hass.config.location_name
 
-        oe_token = await exchange_token(
+        enroll_result = await enroll_ha(
             hass=self.hass,
             portal_url=self._portal_url,
             kc_access_token=access_token,
-            ha_uuid=ha_uuid,
-            ha_name=ha_name,
-            ha_version=ha_version,
+            label=label,
+            device_uid=device_uid,
         )
 
         entry_data: dict[str, Any] = {
@@ -167,8 +174,49 @@ class OpenEnergyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             DATA_KC_USER: kc_user,
         }
 
-        if oe_token:
-            entry_data[DATA_OE_TOKEN] = oe_token
+        if enroll_result:
+            entry_data[DATA_OE_TOKEN] = enroll_result["device_token"]
+            entry_data[DATA_SERVER_UUID] = enroll_result["ha_uuid"]
+            entry_data[DATA_TUNNEL_DOMAIN] = enroll_result["tunnel_domain"]
+            
+            # frpc dict contains server details and device_secret ONLY on enroll
+            frpc_config = enroll_result.get("frpc", {})
+            entry_data[DATA_FRP_SERVER_ADDR] = frpc_config.get("server_addr", "")
+            entry_data[DATA_FRP_SERVER_PORT] = frpc_config.get("server_port", 7000)
+            entry_data[DATA_FRP_TLS_ENABLE] = frpc_config.get("tls_enable", True)
+
+            secret = frpc_config.get("device_secret")
+            if not secret and enroll_result.get("ha_uuid"):
+                # Auto-Repair: We re-enrolled but server kept old secret (not returned).
+                # We must rotate it now to regain control because we have a valid KC token.
+                _LOGGER.warning("Device secret missing from enroll (re-install detected). Rotating FRP secret...")
+                try:
+                    new_secret = await rotate_frp_secret(
+                        self.hass, 
+                        self._portal_url, 
+                        access_token, 
+                        enroll_result["ha_uuid"]
+                    )
+                    if new_secret:
+                        secret = new_secret
+                        _LOGGER.info("FRP secret successfully rotated and recovered.")
+                except Exception as err:
+                    _LOGGER.error("Failed to auto-rotate FRP secret: %s", err)
+
+            if secret:
+                entry_data[DATA_FRP_SECRET] = secret
+                
+                # Configure Add-on immediately
+                await configure_frpc_addon(
+                    hass=self.hass,
+                    server_addr=entry_data[DATA_FRP_SERVER_ADDR],
+                    server_port=entry_data[DATA_FRP_SERVER_PORT],
+                    tls_enable=entry_data[DATA_FRP_TLS_ENABLE],
+                    ha_uuid=enroll_result["ha_uuid"],
+                    device_secret=secret,
+                    tunnel_domain=enroll_result["tunnel_domain"],
+                )
+            
             entry_data[DATA_PROVISIONING_STATE] = "ok"
         else:
             entry_data[DATA_PROVISIONING_STATE] = "exchange_failed"
@@ -208,6 +256,7 @@ class OpenEnergyOptionsFlow(config_entries.OptionsFlow):
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         """Main menu."""
+        # TODO: Add 'rotate_frp' option if needed, for now we stick to basic rotation
         return self.async_show_menu(
             step_id="init",
             menu_options=["status", "server_status", "reconnect", "rotate", "disconnect", "advanced"],
@@ -220,6 +269,7 @@ class OpenEnergyOptionsFlow(config_entries.OptionsFlow):
         kc_user = data.get(DATA_KC_USER, {}) or {}
         has_token = DATA_OE_TOKEN in data
         prov = data.get(DATA_PROVISIONING_STATE, "not_connected")
+        tunnel = data.get(DATA_TUNNEL_DOMAIN, "N/A")
 
         return self.async_show_form(
             step_id="status",
@@ -229,7 +279,7 @@ class OpenEnergyOptionsFlow(config_entries.OptionsFlow):
                 "provisioning": str(prov),
                 "sub": str(kc_user.get("sub", "")),
                 "email": str(kc_user.get("email", "")),
-                "username": str(kc_user.get("preferred_username", "")),
+                "tunnel": str(tunnel),
             },
         )
 
@@ -253,37 +303,25 @@ class OpenEnergyOptionsFlow(config_entries.OptionsFlow):
         return self.async_abort(reason="reauth_started")
 
     async def async_step_rotate(self, user_input: dict[str, Any] | None = None) -> FlowResult:
-        """Rotate the OpenEnergy token via server API."""
-        data = dict(self.config_entry.data)
-        portal_url = data.get(CONF_PORTAL_URL, DEFAULT_PORTAL_URL)
-        oe_token = data.get(DATA_OE_TOKEN)
-
-        if not oe_token:
-            return self.async_show_form(
-                step_id="rotate",
-                data_schema=vol.Schema({}),
-                errors={"base": "no_token"},
-            )
-
-        new_token = await rotate_token(self.hass, portal_url, oe_token)
-        if not new_token:
-            return self.async_show_form(
-                step_id="rotate",
-                data_schema=vol.Schema({}),
-                errors={"base": "rotate_failed"},
-            )
-
-        data[DATA_OE_TOKEN] = new_token
-        data[DATA_PROVISIONING_STATE] = "ok"
-        self.hass.config_entries.async_update_entry(self.config_entry, data=data)
-        await self.hass.config_entries.async_reload(self.config_entry.entry_id)
-        return self.async_abort(reason="rotated")
+        """Rotate the OpenEnergy token via server API (requires reauth first usually).
+        
+        Note: The current rotate_opaque_token implementation requires a KC token.
+        But we don't store KC tokens. So this action will likely fail if we don't prompt for reauth.
+        For now, we just redirect to reauth if we want to be safe, 
+        OR we assume the user just did a reauth flow.
+        """
+        # Since we don't keep KC tokens, we cannot just "rotate" silently. 
+        # We must ask the user to re-authenticate to get a fresh KC token to authorize rotation.
+        return await self.async_step_reconnect()
 
     async def async_step_disconnect(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         """Remove stored tokens and user identity."""
         data = dict(self.config_entry.data)
         data.pop(DATA_OE_TOKEN, None)
         data.pop(DATA_KC_USER, None)
+        data.pop(DATA_SERVER_UUID, None)
+        data.pop(DATA_FRP_SECRET, None)
+        data.pop(DATA_TUNNEL_DOMAIN, None)
         data[DATA_PROVISIONING_STATE] = "not_connected"
         self.hass.config_entries.async_update_entry(self.config_entry, data=data)
         await self.hass.config_entries.async_reload(self.config_entry.entry_id)
@@ -300,6 +338,6 @@ class OpenEnergyOptionsFlow(config_entries.OptionsFlow):
                 "client_id": str(data.get(CONF_CLIENT_ID, "")),
                 "portal": str(data.get(CONF_PORTAL_URL, "")),
                 "health": str(data.get(CONF_HEALTH_URL, "")),
+                "server_uuid": str(data.get(DATA_SERVER_UUID, "")),
             },
         )
-

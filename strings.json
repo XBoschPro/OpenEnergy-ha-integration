@@ -58,5 +58,15 @@
       "rotate_failed": "Token rotation failed.",
       "device_auth_failed": "Device authorization failed. Check Keycloak client settings and server logs."
     }
+  },
+  "issues": {
+    "trusted_proxies_configuration": {
+      "title": "Configure Trusted Proxies",
+      "description": "To allow remote access via the OpenEnergy tunnel, you must configure 'trusted_proxies' in your configuration.yaml.\n\nAdd '127.0.0.1' and '::1' to the 'http' -> 'trusted_proxies' list and enable 'use_x_forwarded_for'. See the documentation link for details."
+    },
+    "addon_not_installed": {
+      "title": "OpenEnergy Add-on Missing",
+      "description": "The 'OpenEnergy FRP Client' add-on is not detected. Please install it from the add-on store to enable remote access."
+    }
   }
 }
