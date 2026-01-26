@@ -1,0 +1,7 @@
+# ONLY FOR DEVELOPPMENT PURPOSES
+# DO NOT USE IN PRODUCTION
+
+logger:
+  default: info
+  logs:
+    custom_components.openenergy: debug

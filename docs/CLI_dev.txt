@@ -1,0 +1,172 @@
+####################################################################################
+## Token creation
+
+### STEP 1 :
+
+ISSUER="https://auth1.openenergy.be/realms/portalOpenenergy"
+META="$ISSUER/.well-known/openid-configuration"
+
+DEVICE_ENDPOINT="$(curl -sS "$META" | jq -r '.device_authorization_endpoint')"
+TOKEN_ENDPOINT="$(curl -sS "$META" | jq -r '.token_endpoint')"
+
+echo "DEVICE_ENDPOINT=$DEVICE_ENDPOINT"
+echo "TOKEN_ENDPOINT=$TOKEN_ENDPOINT"
+
+CLIENT_ID="openenergy-ha"
+SCOPE="openid profile email"
+
+RESP="$(curl -sS -X POST "$DEVICE_ENDPOINT" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  --data-urlencode "client_id=$CLIENT_ID" \
+  --data-urlencode "scope=$SCOPE")"
+
+echo "$RESP" | jq
+DEVICE_CODE="$(echo "$RESP" | jq -r '.device_code')"
+INTERVAL="$(echo "$RESP" | jq -r '.interval // 5')"
+VERIF_URL="$(echo "$RESP" | jq -r '.verification_uri_complete // .verification_uri')"
+
+echo "Go login: $VERIF_URL"
+
+## STEP 2 : Go to URL and login 
+## STEP 3 : Token polling
+
+while true; do
+  TOK="$(curl -sS -X POST "$TOKEN_ENDPOINT" \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    --data-urlencode "grant_type=urn:ietf:params:oauth:grant-type:device_code" \
+    --data-urlencode "client_id=$CLIENT_ID" \
+    --data-urlencode "device_code=$DEVICE_CODE")"
+
+  ERR="$(echo "$TOK" | jq -r '.error // empty')"
+  if [ -z "$ERR" ]; then
+    echo "$TOK" | jq
+    ACCESS_TOKEN="$(echo "$TOK" | jq -r '.access_token')"
+    break
+  fi
+
+  echo "Waiting: $ERR"
+  sleep "$INTERVAL"
+done
+
+echo "ACCESS_TOKEN acquired (length=$(echo -n "$ACCESS_TOKEN" | wc -c))"
+
+
+## STEP 4 : Test API
+ENROLL="$(curl -sS -X POST https://portal.openenergy.be/api/ha/enroll \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "device_uid": "cli-test-001",
+    "label": "CLI Test 001"
+  }')"
+
+echo "$ENROLL" | jq
+DEVICE_TOKEN="$(echo "$ENROLL" | jq -r '.device_token')"
+FRP_SECRET="$(echo "$ENROLL" | jq -r '.frpc.device_secret // empty')"
+
+echo "DEVICE_TOKEN length=$(echo -n "$DEVICE_TOKEN" | wc -c)"
+echo "FRP_SECRET present? $( [ -n "$FRP_SECRET" ] && echo yes || echo no )"
+
+
+## STEP 5 : checks
+## -- frpc
+curl -sS https://portal.openenergy.be/api/ha/frpc \
+  -H "Authorization: Bearer $DEVICE_TOKEN" | jq
+
+## -- Test supervisor (0 = not ok, >1 = ok)
+CORE="$(docker ps --format '{{.Names}}' | grep -i homeassistant | head -n1)"
+docker exec -it "$CORE" sh -lc 'echo -n "$SUPERVISOR_TOKEN" | wc -c'
+
+## -- Test API supervisor :
+docker exec -it "$CORE" sh -lc \
+'curl -sS -H "Authorization: Bearer $SUPERVISOR_TOKEN" http://supervisor/supervisor/info | head -c 200; echo'
+
+## -- user info 
+ISSUER="https://auth1.openenergy.be/realms/portalOpenenergy"
+USERINFO="$(curl -sS "$ISSUER/.well-known/openid-configuration" | jq -r '.userinfo_endpoint')"
+echo "USERINFO=$USERINFO"
+
+curl -sS -D - -o /tmp/userinfo.json \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  "$USERINFO"
+
+echo
+cat /tmp/userinfo.json; echo
+
+
+## -- enroll
+KC_TOKEN="$ACCESS_TOKEN"
+ENROLL="$(curl -sS -X POST https://portal.openenergy.be/api/ha/enroll \
+  -H "Authorization: Bearer $KC_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"device_uid":"cli-test-001","label":"CLI Test 001"}')"
+
+echo "$ENROLL" | jq
+
+
+
+## -- Check token
+TOKEN="$ACCESS_TOKEN"
+
+b64url_decode() {
+  # Decode base64url -> raw JSON
+  local s="$1"
+  s="${s//-/+}"
+  s="${s//_/\//}"
+  case $(( ${#s} % 4 )) in
+    0) : ;;
+    2) s="${s}==";;
+    3) s="${s}=";;
+    1) echo "Invalid base64url length" >&2; return 1;;
+  esac
+  echo -n "$s" | base64 -d 2>/dev/null
+}
+
+HDR_B64="$(echo -n "$TOKEN" | cut -d. -f1)"
+PAY_B64="$(echo -n "$TOKEN" | cut -d. -f2)"
+
+echo "=== JWT header ==="
+b64url_decode "$HDR_B64" | jq .
+
+echo "=== JWT payload (claims utiles) ==="
+b64url_decode "$PAY_B64" | jq '{iss,aud,azp,scope,sub,exp,iat,typ,preferred_username,email}'
+
+EXP="$(b64url_decode "$PAY_B64" | jq -r '.exp // 0')"
+NOW="$(date +%s)"
+echo "exp in: $((EXP-NOW)) seconds"
+
+####################################################################################
+## Token finder : 
+CORE="$(docker ps --format '{{.Names}}' | grep -i homeassistant | head -n1)"
+echo "CORE=$CORE"
+
+docker exec -it "$CORE" ls -la /config/.storage
+docker exec -it "$CORE" cat /config/.storage/core.config_entries | jq -r '
+  .data.entries[]
+  | select(.domain=="openenergy")
+  | {title, entry_id, data, options}
+'
+
+
+## TOKEN OPAQUE :
+ls -la /mnt/supervisor/homeassistant/.storage
+cat /mnt/supervisor/homeassistant/.storage/core.config_entries | jq -r '
+  .data.entries[]
+  | select(.domain=="openenergy")
+  | {title, entry_id, data, options}
+'
+
+
+
+######################################################################################
+## Test configuration addons
+
+CORE="$(docker ps --format '{{.Names}}' | grep -i homeassistant | head -n1)"
+ADDON_SLUG="local_openenergy_frpc"
+
+docker exec -it "$CORE" sh -lc '
+  echo "SUP_LEN=${#SUPERVISOR_TOKEN}"
+  curl -sS -w "\nHTTP=%{http_code}\n" \
+    -H "Authorization: Bearer $SUPERVISOR_TOKEN" \
+    http://supervisor/supervisor/info | head -c 200; echo
+'

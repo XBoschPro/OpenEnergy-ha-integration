@@ -1,7 +1,15 @@
 """Constants for the OpenEnergy integration."""
 
+from __future__ import annotations
+
+from homeassistant.const import Platform
+
 DOMAIN = "openenergy"
-PLATFORMS: list[str] = []
+
+PLATFORMS: list[Platform] = [
+    Platform.SENSOR,
+    Platform.BUTTON,
+]
 
 CONF_ISSUER_URL = "issuer_url"
 CONF_CLIENT_ID = "client_id"
@@ -20,3 +28,5 @@ SCOPE_BASE = "openid profile email"
 DATA_KC_USER = "kc_user"                 # {'sub': ..., 'email': ..., 'preferred_username': ...}
 DATA_OE_TOKEN = "openenergy_token"       # opaque token issued by OpenEnergy server
 DATA_PROVISIONING_STATE = "provisioning_state"  # 'ok' | 'exchange_failed' | 'not_connected'
+DATA_HA_UUID = "ha_uuid"                 # UUID OpenEnergy renvoyé par /api/ha/enroll
+DATA_FRP_DEVICE_SECRET = "frp_device_secret"  # secret FRP renvoyé une seule fois lors du 1er enroll

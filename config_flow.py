@@ -21,8 +21,10 @@ import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.data_entry_flow import FlowResult
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.helpers import instance_id
 
-from .api import exchange_token, get_health, rotate_token
+from .api import get_health
 from .const import (
     CONF_CLIENT_ID,
     CONF_HEALTH_URL,
@@ -37,8 +39,12 @@ from .const import (
     DEFAULT_PORTAL_URL,
     DOMAIN,
     SCOPE_BASE,
+    DATA_HA_UUID,
+    DATA_FRP_DEVICE_SECRET,
 )
 from .device_auth import DeviceCodeResponse, fetch_userinfo, poll_token_once, request_device_code
+from .portal_api import PortalClient, PortalConfig, PortalAuthError
+
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -145,19 +151,50 @@ class OpenEnergyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         access_token = token_result.access_token
         kc_user = await fetch_userinfo(self.hass, self._issuer_url, access_token)
 
-        # Exchange for OpenEnergy token (may fail until API exists).
-        ha_uuid = str(self.hass.config.as_dict().get("config_source", "")) or self.hass.config.config_dir
-        ha_name = self.hass.config.location_name or "Home Assistant"
-        ha_version = str(self.hass.config.as_dict().get("version", ""))
 
-        oe_token = await exchange_token(
-            hass=self.hass,
-            portal_url=self._portal_url,
-            kc_access_token=access_token,
-            ha_uuid=ha_uuid,
-            ha_name=ha_name,
-            ha_version=ha_version,
-        )
+        # Build portal client
+        portal = PortalClient(self.hass, PortalConfig(portal_url=self._portal_url))
+
+        # Stable HA installation identifier
+        device_uid = await instance_id.async_get(self.hass)
+
+        # Human label shown in DB / portal
+        label = self.hass.config.location_name or "Home Assistant"
+
+        # If this is a reauth, you can reuse existing ha_uuid (optional)
+        existing_entry = None
+        if "entry_id" in self.context:
+            existing_entry = self.hass.config_entries.async_get_entry(self.context["entry_id"])
+        existing_ha_uuid = existing_entry.data.get(DATA_HA_UUID) if existing_entry else None
+
+        try:
+            enroll = await portal.async_enroll(
+                kc_access_token=access_token,
+                ha_uuid=existing_ha_uuid,
+                device_uid=device_uid,
+                device_mac=None,
+                label=label,
+            )
+        except PortalAuthError as err:
+            _LOGGER.error("Portal enroll rejected: %s", err)
+            self._last_token_error = "portal_enroll_rejected"
+            return self.async_show_form(
+                step_id="device",
+                data_schema=vol.Schema({}),
+                description_placeholders=placeholders | {"last_error": "portal_enroll_rejected"},
+            )
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.exception("Portal enroll failed: %s", err)
+            self._last_token_error = "portal_enroll_failed"
+            return self.async_show_form(
+                step_id="device",
+                data_schema=vol.Schema({}),
+                description_placeholders=placeholders | {"last_error": "portal_enroll_failed"},
+            )
+
+        device_token = enroll.get("device_token")
+        ha_uuid_server = enroll.get("ha_uuid")
+        frp_secret = (enroll.get("frpc") or {}).get("device_secret")
 
         entry_data: dict[str, Any] = {
             CONF_ISSUER_URL: self._issuer_url,
@@ -167,13 +204,18 @@ class OpenEnergyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             DATA_KC_USER: kc_user,
         }
 
-        if oe_token:
-            entry_data[DATA_OE_TOKEN] = oe_token
+        if isinstance(device_token, str) and device_token:
+            entry_data[DATA_OE_TOKEN] = device_token
             entry_data[DATA_PROVISIONING_STATE] = "ok"
+            if isinstance(ha_uuid_server, str) and ha_uuid_server:
+                entry_data[DATA_HA_UUID] = ha_uuid_server
+            if isinstance(frp_secret, str) and frp_secret:
+                entry_data[DATA_FRP_DEVICE_SECRET] = frp_secret
         else:
-            entry_data[DATA_PROVISIONING_STATE] = "exchange_failed"
+            entry_data[DATA_PROVISIONING_STATE] = "exchange_failed"  # keep your existing label for now
 
         return self.async_create_entry(title="OpenEnergy", data=entry_data)
+
 
     async def async_step_reauth(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         """Reauth uses the same device flow path."""
@@ -206,13 +248,36 @@ class OpenEnergyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 class OpenEnergyOptionsFlow(config_entries.OptionsFlow):
     """Options flow acting as a simple menu."""
 
-    async def async_step_init(self, user_input: dict[str, Any] | None = None) -> FlowResult:
-        """Main menu."""
-        return self.async_show_menu(
-            step_id="init",
-            menu_options=["status", "server_status", "reconnect", "rotate", "disconnect", "advanced"],
-            sort=True,
+    def __init__(self, config_entry: ConfigEntry) -> None:
+        """Initialize options flow."""
+        self._config_entry = config_entry
+
+
+    async def async_step_init(self, user_input=None):
+        """Manage the OpenEnergy options."""
+        if user_input is not None:
+            return self.async_create_entry(title="", data=user_input)
+
+        # Minimal example schema - adapt to your current options
+        current = dict(self._config_entry.options)
+
+        schema = vol.Schema(
+            {
+                vol.Optional("addon_name_contains", default=current.get("addon_name_contains", "OpenEnergy FRP Client")): str,
+                vol.Optional("local_ip", default=current.get("local_ip", "127.0.0.1")): str,
+                vol.Optional("local_port", default=int(current.get("local_port", 8123))): int,
+            }
         )
+
+        return self.async_show_form(step_id="init", data_schema=schema)
+
+    # async def async_step_init(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+    #     """Main menu."""
+    #     return self.async_show_menu(
+    #         step_id="init",
+    #         menu_options=["status", "server_status", "reconnect", "rotate", "disconnect", "advanced"],
+    #         sort=True,
+    #     )
 
     async def async_step_status(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         """Display token/user status."""
@@ -252,32 +317,32 @@ class OpenEnergyOptionsFlow(config_entries.OptionsFlow):
         self.config_entry.async_start_reauth(self.hass)
         return self.async_abort(reason="reauth_started")
 
-    async def async_step_rotate(self, user_input: dict[str, Any] | None = None) -> FlowResult:
-        """Rotate the OpenEnergy token via server API."""
-        data = dict(self.config_entry.data)
-        portal_url = data.get(CONF_PORTAL_URL, DEFAULT_PORTAL_URL)
-        oe_token = data.get(DATA_OE_TOKEN)
+    # async def async_step_rotate(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+    #     """Rotate the OpenEnergy token via server API."""
+    #     data = dict(self.config_entry.data)
+    #     portal_url = data.get(CONF_PORTAL_URL, DEFAULT_PORTAL_URL)
+    #     oe_token = data.get(DATA_OE_TOKEN)
 
-        if not oe_token:
-            return self.async_show_form(
-                step_id="rotate",
-                data_schema=vol.Schema({}),
-                errors={"base": "no_token"},
-            )
+    #     if not oe_token:
+    #         return self.async_show_form(
+    #             step_id="rotate",
+    #             data_schema=vol.Schema({}),
+    #             errors={"base": "no_token"},
+    #         )
 
-        new_token = await rotate_token(self.hass, portal_url, oe_token)
-        if not new_token:
-            return self.async_show_form(
-                step_id="rotate",
-                data_schema=vol.Schema({}),
-                errors={"base": "rotate_failed"},
-            )
+    #     new_token = await rotate_token(self.hass, portal_url, oe_token)
+    #     if not new_token:
+    #         return self.async_show_form(
+    #             step_id="rotate",
+    #             data_schema=vol.Schema({}),
+    #             errors={"base": "rotate_failed"},
+    #         )
 
-        data[DATA_OE_TOKEN] = new_token
-        data[DATA_PROVISIONING_STATE] = "ok"
-        self.hass.config_entries.async_update_entry(self.config_entry, data=data)
-        await self.hass.config_entries.async_reload(self.config_entry.entry_id)
-        return self.async_abort(reason="rotated")
+    #     data[DATA_OE_TOKEN] = new_token
+    #     data[DATA_PROVISIONING_STATE] = "ok"
+    #     self.hass.config_entries.async_update_entry(self.config_entry, data=data)
+    #     await self.hass.config_entries.async_reload(self.config_entry.entry_id)
+    #     return self.async_abort(reason="rotated")
 
     async def async_step_disconnect(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         """Remove stored tokens and user identity."""

@@ -1,8 +1,4 @@
 """OpenEnergy server API client.
-
-This is intentionally small for the first iteration:
-- exchange Keycloak access token -> OpenEnergy opaque token
-- rotate OpenEnergy token
 - health check (public)
 """
 
@@ -26,62 +22,62 @@ async def get_health(hass: HomeAssistant, health_url: str) -> tuple[bool, str]:
         return False, f"error: {err}"
 
 
-async def exchange_token(
-    hass: HomeAssistant,
-    portal_url: str,
-    kc_access_token: str,
-    ha_uuid: str,
-    ha_name: str,
-    ha_version: str,
-) -> str | None:
-    """Exchange Keycloak access token for an OpenEnergy opaque token.
+# async def exchange_token(
+#     hass: HomeAssistant,
+#     portal_url: str,
+#     kc_access_token: str,
+#     ha_uuid: str,
+#     ha_name: str,
+#     ha_version: str,
+# ) -> str | None:
+#     """Exchange Keycloak access token for an OpenEnergy opaque token.
 
-    Expected server endpoint (to implement later):
-      POST {portal_url}/api/ha/auth/exchange
-      Authorization: Bearer <kc_access_token>
-      JSON body: {ha_uuid, ha_name, ha_version}
-      Response JSON: {"openenergy_token": "<opaque>"}
-    """
-    session = aiohttp_client.async_get_clientsession(hass)
-    url = f"{portal_url.rstrip('/')}/api/ha/auth/exchange"
-    headers = {"Authorization": f"Bearer {kc_access_token}"}
-    payload: dict[str, Any] = {
-        "ha_uuid": ha_uuid,
-        "ha_name": ha_name,
-        "ha_version": ha_version,
-    }
+#     Expected server endpoint (to implement later):
+#       POST {portal_url}/api/ha/auth/exchange
+#       Authorization: Bearer <kc_access_token>
+#       JSON body: {ha_uuid, ha_name, ha_version}
+#       Response JSON: {"openenergy_token": "<opaque>"}
+#     """
+#     session = aiohttp_client.async_get_clientsession(hass)
+#     url = f"{portal_url.rstrip('/')}/api/ha/auth/exchange"
+#     headers = {"Authorization": f"Bearer {kc_access_token}"}
+#     payload: dict[str, Any] = {
+#         "ha_uuid": ha_uuid,
+#         "ha_name": ha_name,
+#         "ha_version": ha_version,
+#     }
 
-    try:
-        async with session.post(url, json=payload, headers=headers, timeout=20) as resp:
-            if resp.status >= 400:
-                return None
-            data = await resp.json()
-    except Exception:  # noqa: BLE001
-        return None
+#     try:
+#         async with session.post(url, json=payload, headers=headers, timeout=20) as resp:
+#             if resp.status >= 400:
+#                 return None
+#             data = await resp.json()
+#     except Exception:  # noqa: BLE001
+#         return None
 
-    token = data.get("openenergy_token") or data.get("token")
-    return token if isinstance(token, str) and token else None
+#     token = data.get("openenergy_token") or data.get("token")
+#     return token if isinstance(token, str) and token else None
 
 
-async def rotate_token(hass: HomeAssistant, portal_url: str, oe_token: str) -> str | None:
-    """Rotate OpenEnergy token server-side.
+# async def rotate_token(hass: HomeAssistant, portal_url: str, oe_token: str) -> str | None:
+#     """Rotate OpenEnergy token server-side.
 
-    Expected server endpoint (to implement later):
-      POST {portal_url}/api/ha/auth/rotate
-      Authorization: Bearer <oe_token>
-      Response JSON: {"openenergy_token": "<new opaque>"}
-    """
-    session = aiohttp_client.async_get_clientsession(hass)
-    url = f"{portal_url.rstrip('/')}/api/ha/auth/rotate"
-    headers = {"Authorization": f"Bearer {oe_token}"}
+#     Expected server endpoint (to implement later):
+#       POST {portal_url}/api/ha/auth/rotate
+#       Authorization: Bearer <oe_token>
+#       Response JSON: {"openenergy_token": "<new opaque>"}
+#     """
+#     session = aiohttp_client.async_get_clientsession(hass)
+#     url = f"{portal_url.rstrip('/')}/api/ha/auth/rotate"
+#     headers = {"Authorization": f"Bearer {oe_token}"}
 
-    try:
-        async with session.post(url, headers=headers, timeout=20) as resp:
-            if resp.status >= 400:
-                return None
-            data = await resp.json()
-    except Exception:  # noqa: BLE001
-        return None
+#     try:
+#         async with session.post(url, headers=headers, timeout=20) as resp:
+#             if resp.status >= 400:
+#                 return None
+#             data = await resp.json()
+#     except Exception:  # noqa: BLE001
+#         return None
 
-    token = data.get("openenergy_token") or data.get("token")
-    return token if isinstance(token, str) and token else None
+#     token = data.get("openenergy_token") or data.get("token")
+#     return token if isinstance(token, str) and token else None
